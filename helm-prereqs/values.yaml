@@ -28,10 +28,10 @@ clusterApiServer: ""
 
 ## ---------------------------------------------------------------------------
 ## Vault connection (used by vault-pki-config Job and vault-nico-issuer)
-## Vault address uses vaultNamespace above: vault.<vaultNamespace>.svc.cluster.local
+## Vault address uses the namespace-qualified service name.
 ## ---------------------------------------------------------------------------
 vault:
-  address: "https://vault.vault.svc.cluster.local:8200"
+  address: "https://vault.vault:8200"
   ## setup.sh/helmfile supplies this dynamically from vaultroottoken.
   ## Direct Helm users should set this when tokenSecret.create=true, or
   ## pre-create nico-system/nico-vault-token and set tokenSecret.create=false.
