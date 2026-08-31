@@ -4,6 +4,8 @@
 package config
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,6 +85,29 @@ issuers:
 	require.Len(t, issuers[0].ClaimMappings, 1)
 	assert.Equal(t, []string{"issuer-audience"}, issuers[0].Audiences)
 	assert.Equal(t, []string{"org-audience"}, issuers[0].ClaimMappings[0].Audiences)
+}
+
+func TestGetOrInitJWTOriginConfig_KeycloakUnavailable(t *testing.T) {
+	testServer := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		res.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer testServer.Close()
+
+	v := viper.New()
+	v.Set(ConfigKeycloakEnabled, true)
+	v.Set(ConfigKeycloakBaseURL, testServer.URL)
+	v.Set(ConfigKeycloakExternalBaseURL, "https://keycloak.example.com")
+	v.Set(ConfigKeycloakRealm, "test-realm")
+	v.Set(ConfigKeycloakClientID, "test-client")
+	v.Set(ConfigKeycloakClientSecret, "test-secret")
+
+	c := &Config{v: v}
+	jwtOriginConfig := c.GetOrInitJWTOriginConfig()
+
+	require.NotNil(t, jwtOriginConfig)
+	jwksConfig := jwtOriginConfig.GetConfig("https://keycloak.example.com/realms/test-realm")
+	require.NotNil(t, jwksConfig)
+	assert.Nil(t, jwksConfig.GetJWKS())
 }
 
 func TestConfig_WatchConfigFile(t *testing.T) {
