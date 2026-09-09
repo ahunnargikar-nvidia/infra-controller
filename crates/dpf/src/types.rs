@@ -20,10 +20,13 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use serde::{Deserialize, Serialize};
 
-use crate::crds::dpus_generated::DpuStatusPhase;
+use crate::crds::dpus_generated::{
+    DpuStatusAgentStatus, DpuStatusOperationalConditions, DpuStatusPhase,
+};
 
 /// Async provider for BMC passwords used to create and refresh the K8s BMC
 /// secret. Implement this trait to supply credentials dynamically (e.g. from
@@ -92,11 +95,22 @@ pub struct InitDpfResourcesConfig {
     /// SF capacity reserved beyond configured NICo-managed service endpoints.
     /// Without intercept bridging, this remains the complete legacy `PF_TOTAL_SF` value.
     pub pf_total_sf_reserved: u32,
+    /// Managed SF capacity not represented in [`interfaces`](Self::interfaces).
+    /// Added to calculated BF3/generic-BF4 capacity when intercept bridging is configured;
+    /// otherwise it consumes the unchanged legacy pool. BF4 Astra rejects a non-zero value.
+    pub additional_managed_sf: u32,
     /// Enables deployment-scoped DPUServiceInterface names and node selectors.
     /// False preserves the legacy global resource naming and selector mode for
-    /// BF3 and generic BF4; BF4 Astra requires this to be true.
-    /// Mode transitions require manual old-resource cleanup and DPU re-ingestion;
-    /// the SDK neither detects nor deletes the previous generation.
+    /// BF3 (including BF3 GB200) and generic BF4. BF4 Astra requires this to be true for the
+    /// whole namespace so
+    /// legacy match-all resources do not bind Astra nodes. When enabled, initialization removes
+    /// legacy unscoped ServiceInterfaces before creating scoped replacements. If cleanup remains
+    /// incomplete for ten minutes, NICo logs an error and continues waiting. If an operator
+    /// manually completes unscoped cleanup, NICo creates scoped replacements. The setting is read
+    /// only at startup. To return to unscoped interfaces, callers must stop NICo, delete scoped
+    /// ServiceInterfaces and wait for their deletion, then restart with this disabled.
+    /// API-core rejects a disabled value during DPF initialization while scoped
+    /// ServiceInterfaces exist.
     pub deployment_scoped_service_interfaces: bool,
     /// Optional intercept-bridging topology for BF3 and generic BF4. `Some` replaces the
     /// ordinary static PF/VF inventory and contains exactly one configured PF.
@@ -107,6 +121,15 @@ pub struct InitDpfResourcesConfig {
     pub interfaces: Vec<DpuServiceInterfaceTemplateDefinition>,
 
     pub proxy: Option<DpfProxyDetails>,
+    /// Operator-supplied bf.cfg lines appended to the flavor's built-in `bfcfgParameters`.
+    ///
+    /// Passed through verbatim; the SDK applies no quoting or interpretation. Entries containing
+    /// the Go template delimiter `{{` are rejected, since BF4 Astra renders its
+    /// DPUFlavorTemplate body and could not pass them through.
+    ///
+    /// WARNING: Changing this will generate a new DPUFlavor, reprovisioning the deployment's
+    /// DPUs.
+    pub extra_bfcfg_parameters: Vec<String>,
     /// Deployment type — determines which DPUFlavor spec to build.
     pub deployment_type: DpuDeploymentType,
 }
@@ -133,10 +156,12 @@ impl Default for InitDpfResourcesConfig {
             services: Vec::new(),
             num_of_vfs: DEFAULT_DPU_NUM_OF_VFS,
             pf_total_sf_reserved: DEFAULT_PF_TOTAL_SF_RESERVED,
+            additional_managed_sf: 0,
             deployment_scoped_service_interfaces: false,
             intercept_bridging: None,
             interfaces: Vec::new(),
             proxy: None,
+            extra_bfcfg_parameters: Vec::new(),
             deployment_type: DpuDeploymentType::Bf3,
         }
     }
@@ -890,6 +915,16 @@ pub struct DpuSummary {
     pub spec_dpu_node_name: String,
     pub status_phase: Option<String>,
     pub status_bfb_file: Option<String>,
+    /// `status.conditions`, verbatim. `phase` alone says where a DPU is, not
+    /// why it is stuck there; the conditions carry the reason and message.
+    pub status_conditions: Option<Vec<Condition>>,
+    /// `status.operationalConditions`, verbatim. Separate from `conditions`:
+    /// these describe the DPU's health once provisioned, rather than the
+    /// progress of provisioning itself.
+    pub status_operational_conditions: Option<Vec<DpuStatusOperationalConditions>>,
+    /// `status.agentStatus`, verbatim. What the DPU-side agent reports about
+    /// itself, including its own conditions, kubelet version, and reboot state.
+    pub status_agent_status: Option<DpuStatusAgentStatus>,
 }
 
 /// Service version resolved from a DPUDeployment's services and their DPUServiceTemplate CRs.

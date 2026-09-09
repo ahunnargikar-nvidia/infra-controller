@@ -51,6 +51,10 @@ pub struct Config {
 
     pub collectors: CollectorsConfig,
 
+    /// Opt-in attributes attached to emitted telemetry beyond what a collector
+    /// reports on its own.
+    pub attributes: AttributesConfig,
+
     pub processors: ProcessorsConfig,
 
     pub metrics: MetricsConfig,
@@ -86,6 +90,7 @@ impl Default for Config {
             sinks: SinksConfig::default(),
             rate_limit: Configurable::Enabled(RateLimitConfig::default()),
             collectors: CollectorsConfig::default(),
+            attributes: AttributesConfig::default(),
             processors: ProcessorsConfig::default(),
             metrics: MetricsConfig::default(),
             shard: 0,
@@ -96,6 +101,28 @@ impl Default for Config {
             bmc_proxy_url: None,
         }
     }
+}
+
+/// Opt-in identity attributes attached to emitted telemetry.
+///
+/// These are attached as log record attributes and metric datapoint attributes
+/// rather than resource attributes: a single BMC endpoint fronts many GPUs, so
+/// per-GPU identity cannot be a property of the resource without changing how
+/// telemetry is grouped.
+///
+/// Defaults to disabled, so a deployment opts in to the added metric labels.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AttributesConfig {
+    /// Attach `gpu_uuid`, `gpu_serial`, `gpu_chassis_serial`, and `gpu_model`,
+    /// read from the Redfish resource that reports each GPU.
+    ///
+    /// On metrics these land on the sensor series that already exist for the
+    /// GPU's processor and chassis. On SSE log records they are resolved by
+    /// matching `origin_of_condition` against the discovered inventory. Both
+    /// read resources discovery already fetches, so no Redfish requests are
+    /// added.
+    pub gpu_identity: bool,
 }
 
 /// Configuration for where BMC endpoints are discovered from.
@@ -352,6 +379,7 @@ impl StaticBmcEndpoint {
             "machine_slot_number",
             "machine_tray_index",
             "nvlink_domain_uuid",
+            "power_shelf_id",
             "rack_id",
             "serial_number",
             "switch_id",
@@ -1440,7 +1468,7 @@ pub struct PeriodicLogConfig {
     /// `["Journal"]` to suppress the bmcweb HTTP-access log, which is
     /// high-volume and self-referential. Set to `[]` to collect from every
     /// discovered LogService.
-    #[serde(default)]
+    #[serde(default = "default_excluded_log_services")]
     pub exclude_services: Vec<String>,
 
     /// When true, on the first encounter of a LogService with no saved state,
@@ -1458,10 +1486,14 @@ impl Default for PeriodicLogConfig {
             logs_collection_interval: Duration::from_secs(300),
             state_refresh_interval: Duration::from_secs(1800),
             logs_state_file: "/tmp/logs_collector_{machine_id}.json".to_string(),
-            exclude_services: vec!["Journal".to_string()],
+            exclude_services: default_excluded_log_services(),
             skip_initial_history: false,
         }
     }
+}
+
+fn default_excluded_log_services() -> Vec<String> {
+    vec!["Journal".to_string()]
 }
 
 /// downgrade thresholds and periodic fallback for `collectors.logs.mode = "auto"`.
@@ -2471,10 +2503,7 @@ mod tests {
     }
 
     fn parsed_periodic_defaults() -> PeriodicLogConfig {
-        PeriodicLogConfig {
-            exclude_services: vec![],
-            ..PeriodicLogConfig::default()
-        }
+        PeriodicLogConfig::default()
     }
 
     #[test]
@@ -4930,7 +4959,11 @@ machine = { id = "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", 
 
     #[test]
     fn test_static_endpoint_rejects_invalid_or_reserved_label_names() {
-        for (name, expected) in [("bad-label", "must match"), ("system_uuid", "is reserved")] {
+        for (name, expected) in [
+            ("bad-label", "must match"),
+            ("power_shelf_id", "is reserved"),
+            ("system_uuid", "is reserved"),
+        ] {
             let toml_content = format!(
                 r#"
 [endpoint_sources.nico_api]
@@ -5262,6 +5295,75 @@ switch = { serial = "SN-SW-001", physical_slot_number = 7, compute_tray_index = 
                     "[collectors.logs.sse].max_backoff must be greater than or equal to initial_backoff"
                         .to_string()
                 ),
+            }
+        );
+    }
+
+    #[test]
+    fn excluded_log_services_config_surface() {
+        scenarios!(run = |toml| {
+            Figment::new()
+                .merge(Serialized::defaults(Config::default()))
+                .merge(Toml::string(toml))
+                .extract::<Config>()
+                .map_err(|_| ())
+                .and_then(|config| {
+                    config.validate().map_err(|_| ())?;
+                    let logs = config.collectors.logs.as_option().ok_or(())?;
+
+                    Ok(match logs.mode {
+                        LogCollectionMode::Auto => {
+                            logs.auto_periodic_or_default().exclude_services
+                        }
+                        LogCollectionMode::Periodic => {
+                            logs.periodic_or_default().exclude_services
+                        }
+                        LogCollectionMode::Sse => Vec::new(),
+                    })
+                })
+        };
+            "periodic mode" {
+                r#"
+[collectors.logs]
+mode = "periodic"
+[collectors.logs.periodic]
+"# => Yields(vec!["Journal".to_string()]),
+
+                r#"
+[collectors.logs]
+mode = "periodic"
+[collectors.logs.periodic]
+exclude_services = ["Journal", "Dump"]
+"# => Yields(vec!["Journal".to_string(), "Dump".to_string()]),
+
+                r#"
+[collectors.logs]
+mode = "periodic"
+[collectors.logs.periodic]
+exclude_services = []
+"# => Yields(vec![]),
+            }
+
+            "auto fallback" {
+                r#"
+[collectors.logs]
+mode = "auto"
+[collectors.logs.auto]
+"# => Yields(vec!["Journal".to_string()]),
+
+                r#"
+[collectors.logs]
+mode = "auto"
+[collectors.logs.auto]
+exclude_services = ["Journal", "Dump"]
+"# => Yields(vec!["Journal".to_string(), "Dump".to_string()]),
+
+                r#"
+[collectors.logs]
+mode = "auto"
+[collectors.logs.auto]
+exclude_services = []
+"# => Yields(vec![]),
             }
         );
     }

@@ -44,6 +44,22 @@ fn logs_state_file_path(template: &str, endpoint_id: &str) -> PathBuf {
     PathBuf::from(template.replace("{machine_id}", endpoint_id))
 }
 
+fn build_periodic_logs_collector_config(
+    config: &PeriodicLogConfig,
+    state_file_path: PathBuf,
+    data_sink: Option<Arc<dyn DataSink>>,
+    include_diagnostics: bool,
+) -> LogsCollectorConfig {
+    LogsCollectorConfig {
+        state_file_path,
+        service_refresh_interval: config.state_refresh_interval,
+        data_sink,
+        include_diagnostics,
+        exclude_services: config.exclude_services.clone(),
+        skip_initial_history: config.skip_initial_history,
+    }
+}
+
 /// Returns whether an endpoint is eligible for direct NMX-C Subscribe collection.
 pub(super) fn switch_supports_nmxc_subscription(endpoint: &BmcEndpoint) -> bool {
     endpoint.switch_data().is_some_and(|switch| {
@@ -185,8 +201,11 @@ fn spawn_generic_redfish_collectors(
     let gpu_inventory_enabled = matches!(ctx.gpu_inventory_config, Configurable::Enabled(_))
         && ctx.api_client.is_some()
         && matches!(endpoint.metadata, Some(EndpointMetadata::Machine(_)));
+    // GPU identity attributes on log records are resolved against the shared
+    // entity inventory, so discovery must also run for a logs-only deployment.
+    let gpu_identity_enabled = ctx.attributes.gpu_identity;
 
-    if (sensors_enabled || metrics_enabled || gpu_inventory_enabled)
+    if (sensors_enabled || metrics_enabled || gpu_inventory_enabled || gpu_identity_enabled)
         && !ctx.collectors.contains(CollectorKind::Discovery, &key)
     {
         let shared = ctx.collectors.inventory_for(&key);
@@ -200,6 +219,7 @@ fn spawn_generic_redfish_collectors(
             EntityDiscoveryCollectorConfig {
                 shared,
                 request_concurrency: ctx.bmc_request_concurrency,
+                gpu_identity: gpu_identity_enabled,
             },
             CollectorStartContext {
                 limiter: ctx.limiter.clone(),
@@ -367,6 +387,14 @@ fn spawn_generic_redfish_collectors(
                 .create_collector_registry(format!("log_collector_{key}"), metrics_prefix)?,
         );
 
+        // Resolved once here because both SSE spawn paths below share the
+        // endpoint's inventory handle.
+        let sse_gpu_inventory = if ctx.attributes.gpu_identity {
+            Some(ctx.collectors.inventory_for(&key))
+        } else {
+            None
+        };
+
         let sse_cfg = logs_cfg.sse_or_default();
         let sse_backoff_config = || BackoffConfig {
             initial: sse_cfg.initial_backoff,
@@ -379,18 +407,17 @@ fn spawn_generic_redfish_collectors(
          -> Option<Result<Collector, HealthError>> {
             let endpoint_id = endpoint.log_identity().into_owned();
             let state_file_path = logs_state_file_path(&pcfg.logs_state_file, &endpoint_id);
+            let collector_config = build_periodic_logs_collector_config(
+                &pcfg,
+                state_file_path,
+                data_sink,
+                ctx.logs_include_diagnostics,
+            );
 
             Some(Collector::start::<LogsCollector<BmcClient>>(
                 endpoint_arc.clone(),
                 bmc.clone(),
-                LogsCollectorConfig {
-                    state_file_path,
-                    service_refresh_interval: pcfg.state_refresh_interval,
-                    data_sink,
-                    include_diagnostics: ctx.logs_include_diagnostics,
-                    exclude_services: pcfg.exclude_services.clone(),
-                    skip_initial_history: pcfg.skip_initial_history,
-                },
+                collector_config,
                 CollectorStartContext {
                     limiter: ctx.limiter.clone(),
                     iteration_interval: pcfg.logs_collection_interval,
@@ -409,6 +436,7 @@ fn spawn_generic_redfish_collectors(
                         SseLogCollectorConfig {
                             include_diagnostics: ctx.logs_include_diagnostics,
                             request_concurrency: ctx.bmc_request_concurrency,
+                            gpu_inventory: sse_gpu_inventory,
                         },
                         data_sink,
                         StreamingCollectorStartContext {
@@ -452,6 +480,7 @@ fn spawn_generic_redfish_collectors(
                         SseLogCollectorConfig {
                             include_diagnostics: ctx.logs_include_diagnostics,
                             request_concurrency: ctx.bmc_request_concurrency,
+                            gpu_inventory: sse_gpu_inventory,
                         },
                         data_sink,
                         StreamingCollectorStartContext {
@@ -897,6 +926,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::str::FromStr;
 
+    use carbide_test_support::{Check, check_values};
     use mac_address::MacAddress;
 
     use super::*;
@@ -1032,6 +1062,36 @@ mod tests {
     fn test_logs_state_file_path_replaces_endpoint_id() {
         let path = logs_state_file_path("/tmp/logs_{machine_id}.json", "endpoint-42");
         assert_eq!(path, PathBuf::from("/tmp/logs_endpoint-42.json"));
+    }
+
+    #[test]
+    fn periodic_logs_runtime_config_preserves_excluded_services() {
+        check_values(
+            [
+                Check {
+                    scenario: "custom exclusions",
+                    input: vec!["Journal".to_string(), "Dump".to_string()],
+                    expect: vec!["Journal".to_string(), "Dump".to_string()],
+                },
+                Check {
+                    scenario: "explicit empty exclusions",
+                    input: vec![],
+                    expect: vec![],
+                },
+            ],
+            |exclude_services| {
+                build_periodic_logs_collector_config(
+                    &PeriodicLogConfig {
+                        exclude_services,
+                        ..PeriodicLogConfig::default()
+                    },
+                    PathBuf::from("/tmp/logs_endpoint-42.json"),
+                    None,
+                    false,
+                )
+                .exclude_services
+            },
+        );
     }
 
     #[tokio::test]

@@ -24,6 +24,7 @@ use arc_swap::ArcSwap;
 use carbide_dpa::DpaInfo;
 use carbide_dpa_manager::DpaMonitor;
 use carbide_dpf::DpuDeploymentType;
+use carbide_dpf::repository::DpuServiceInterfaceRepository;
 use carbide_extension_service_controller::context::ExtensionServiceStateHandlerServices;
 use carbide_extension_service_controller::handler::ExtensionServiceStateHandler;
 use carbide_extension_service_controller::io::ExtensionServiceStateControllerIO;
@@ -55,10 +56,10 @@ use carbide_rack_controller::config::RackConfig;
 use carbide_rack_controller::context::RackStateHandlerServices;
 use carbide_rack_controller::handler::RackStateHandler;
 use carbide_rack_controller::io::RackStateControllerIO;
-use carbide_redfish::libredfish::RedfishClientPool;
+use carbide_redfish::libredfish::{BmcCredentialOps, RedfishClientPool};
 use carbide_secrets::certificates::CertificateProvider;
 use carbide_secrets::credentials::{CredentialManager, CredentialReader};
-use carbide_site_explorer::{EndpointExplorationService, SiteExplorer};
+use carbide_site_explorer::{AuthenticatedBmcClient, EndpointExplorationService, SiteExplorer};
 use carbide_spdm_controller::context::SpdmStateHandlerServices;
 use carbide_spdm_controller::handler::SpdmAttestationStateHandler;
 use carbide_spdm_controller::io::SpdmStateControllerIO;
@@ -66,7 +67,6 @@ use carbide_switch_controller::context::SwitchStateHandlerServices;
 use carbide_switch_controller::handler::SwitchStateHandler;
 use carbide_switch_controller::io::SwitchStateControllerIO;
 use carbide_utils::HostPortPair;
-use carbide_utils::none_if_empty::NoneIfEmpty;
 use carbide_vpc_prefix_controller::context::VpcPrefixStateHandlerServices;
 use carbide_vpc_prefix_controller::handler::VpcPrefixStateHandler;
 use carbide_vpc_prefix_controller::io::VpcPrefixStateControllerIO;
@@ -140,7 +140,7 @@ fn create_ipmi_tool(
 fn create_redfish_pool(
     carbide_config: &CarbideConfig,
     credential_manager: Arc<dyn CredentialManager>,
-) -> eyre::Result<Arc<dyn RedfishClientPool>> {
+) -> eyre::Result<(Arc<dyn RedfishClientPool>, Arc<dyn BmcCredentialOps>)> {
     let pool = libredfish::RedfishClientPool::builder()
         .danger_accept_invalid_certs()
         .build()
@@ -184,7 +184,7 @@ fn create_redfish_pool(
         (None, None, _) => {} // leave bmc_proxy untouched
     }
 
-    Ok(carbide_redfish::libredfish::new_pool(
+    Ok(carbide_redfish::libredfish::new_pool_with_credential_ops(
         credential_manager,
         pool,
         carbide_config.site_explorer.bmc_proxy.clone(),
@@ -208,7 +208,8 @@ pub(crate) async fn start_runtime(
     admin_ui_routes_builder: Option<AdminUiRoutesBuilder>,
     cancel_token: CancellationToken,
 ) -> eyre::Result<SocketAddr> {
-    let shared_redfish_pool = create_redfish_pool(&carbide_config, credential_manager.clone())?;
+    let (shared_redfish_pool, bmc_credential_ops) =
+        create_redfish_pool(&carbide_config, credential_manager.clone())?;
     let shared_nv_redfish_pool =
         carbide_redfish::nv_redfish::new_pool(carbide_config.site_explorer.bmc_proxy.clone());
 
@@ -398,11 +399,14 @@ pub(crate) async fn start_runtime(
         carbide_config.bmc_max_sessions_per_caller,
     ));
 
-    let bmc_explorer = carbide_site_explorer::new_bmc_explorer(
-        shared_redfish_pool.clone(),
+    let bmc_client = Arc::new(AuthenticatedBmcClient::new(
+        bmc_credential_ops.clone(),
         shared_nv_redfish_pool,
         ipmi_tool.clone(),
         credential_manager.clone(),
+    ));
+    let bmc_explorer = carbide_site_explorer::new_bmc_explorer(
+        bmc_client.clone(),
         carbide_config
             .site_explorer
             .rotate_switch_nvos_credentials
@@ -521,10 +525,12 @@ pub(crate) async fn start_runtime(
         dpu_health_log_limiter: LogLimiter::default(),
         dynamic_settings,
         endpoint_explorer: bmc_explorer,
+        bmc_client,
         endpoint_exploration_service: endpoint_exploration_service.clone(),
         eth_data,
         ib_fabric_manager,
         redfish_pool: shared_redfish_pool,
+        bmc_credential_ops: bmc_credential_ops.clone(),
         bmc_session_manager,
         runtime_config: carbide_config.clone(),
         scout_stream_registry: ConnectionRegistry::new(),
@@ -627,6 +633,57 @@ fn normalize_dpf_intercept_bridging(
         .map_err(|error| eyre::eyre!("invalid DPF intercept-bridging configuration: {error}"))
 }
 
+/// This function rejects setting deployment_scoped_service_interfaces
+/// to false if there are scoped interfaces present.
+async fn reject_unscoped_initialization_with_scoped_interfaces<R: DpuServiceInterfaceRepository>(
+    repo: &R,
+) -> eyre::Result<()> {
+    tracing::info!(
+        namespace = carbide_dpf::NAMESPACE,
+        "Checking for scoped DPUServiceInterfaces before initializing unscoped interfaces"
+    );
+    let scoped_interfaces = scoped_service_interface_names(
+        DpuServiceInterfaceRepository::list(repo, carbide_dpf::NAMESPACE)
+            .await
+            .map_err(|error| eyre::eyre!("failed to list DPF service interfaces: {error}"))?
+            .into_iter()
+            .map(|interface| {
+                (
+                    interface.metadata.name,
+                    interface.spec.template.spec.node_selector.is_some(),
+                )
+            }),
+    );
+    if !scoped_interfaces.is_empty() {
+        tracing::warn!(
+            service_interfaces = ?scoped_interfaces,
+            "Rejecting unscoped DPF initialization because scoped service interfaces exist"
+        );
+        return Err(eyre::eyre!(
+            "dpf.deployment_scoped_service_interfaces cannot be disabled while scoped DPUServiceInterfaces exist: {}",
+            scoped_interfaces.join(", "),
+        ));
+    }
+
+    Ok(())
+}
+
+fn scoped_service_interface_names(
+    interfaces: impl IntoIterator<Item = (Option<String>, bool)>,
+) -> Vec<String> {
+    interfaces
+        .into_iter()
+        .filter_map(|(name, has_node_selector)| {
+            let name = name?;
+            (has_node_selector
+                && ["bf3", "bf3gb200", "bf4", "astra"]
+                    .iter()
+                    .any(|suffix| name.ends_with(&format!("-{suffix}"))))
+            .then_some(name)
+        })
+        .collect()
+}
+
 /// Initialize the DPF SDK and create all required Kubernetes CRs.
 ///
 /// Returns `None` (with a deprecation warning) when DPF is disabled.
@@ -674,20 +731,37 @@ async fn initialize_dpf_sdk(
         intercept_bridging.as_ref(),
     );
 
+    let astra_interfaces = carbide_dpf::sdk::build_dpu_interfaces_vec();
+
     // SDK construction writes the shared BMC Secret, so capacity validation must remain on the
     // pure configuration path and finish before Kubernetes repository construction.
+    let service_vpc_interfaces = crate::dpf_services::service_vpc_interfaces(
+        &effective_interfaces,
+        carbide_config.dpu_config.service_vpc_slot_count,
+    )
+    .map_err(|error| eyre::eyre!("invalid DPF HBN interface configuration: {error}"))?;
+    let additional_managed_sf = carbide_config
+        .dpu_config
+        .service_vpc_slot_count
+        .checked_add(carbide_config.dpu_config.additional_managed_sf)
+        .ok_or_else(|| eyre::eyre!("dpu_config managed SF count exceeds u32"))?;
     carbide_dpf::calculate_pf_total_sf(
         &effective_interfaces,
         intercept_bridging.as_ref(),
         carbide_config.dpf.pf_total_sf_reserved,
+        additional_managed_sf,
     )
     .map_err(|error| eyre::eyre!("invalid DPF SF configuration: {error}"))?;
-
-    let astra_interfaces = carbide_dpf::sdk::build_dpu_interfaces_vec();
 
     let repo = carbide_dpf::KubeRepository::new()
         .await
         .map_err(|e| eyre::eyre!("failed to create DPF repository: {e}"))?;
+
+    // Scoped interfaces are authoritative: their presence means unscoped initialization would
+    // recreate global resources that can bind deployments incorrectly.
+    if !carbide_config.dpf.deployment_scoped_service_interfaces {
+        reject_unscoped_initialization_with_scoped_interfaces(&repo).await?;
+    }
 
     let provider = CarbideBmcPasswordProvider::new(credential_manager, db_pool.clone());
 
@@ -734,6 +808,14 @@ async fn initialize_dpf_sdk(
                 | DpuDeploymentType::Bf3Gb200
                 | DpuDeploymentType::Bf4Generic => &effective_interfaces,
             };
+            let (service_vpc_interfaces, additional_managed_sf) = match deployment_type {
+                DpuDeploymentType::Bf4Astra => (&[][..], 0),
+                DpuDeploymentType::Bf3
+                | DpuDeploymentType::Bf3Gb200
+                | DpuDeploymentType::Bf4Generic => {
+                    (service_vpc_interfaces.as_slice(), additional_managed_sf)
+                }
+            };
             carbide_dpf::InitDpfResourcesConfig {
                 bfb_url: deployment.bfb_url.clone().unwrap_or_default(),
                 bluefield_software,
@@ -746,10 +828,12 @@ async fn initialize_dpf_sdk(
                     &services,
                     &carbide_config.dpf.dpu_agent_bootstrap_ca,
                     interfaces,
+                    service_vpc_interfaces,
                     &carbide_config.node_auth,
                 ),
                 num_of_vfs: carbide_config.dpu_config.num_of_vfs,
                 pf_total_sf_reserved: carbide_config.dpf.pf_total_sf_reserved,
+                additional_managed_sf,
                 intercept_bridging: match deployment_type {
                     DpuDeploymentType::Bf4Astra => None,
                     DpuDeploymentType::Bf3
@@ -758,6 +842,9 @@ async fn initialize_dpf_sdk(
                 },
                 interfaces: interfaces.clone(),
                 proxy: carbide_config.dpf.proxy.clone(),
+                extra_bfcfg_parameters: carbide_config
+                    .dpf
+                    .resolved_bfcfg_parameters_for(deployment),
                 deployment_type,
             }
         };
@@ -1080,6 +1167,7 @@ async fn initialize_and_start_controllers<'a>(
         database_connection: db_pool,
         ib_fabric_manager,
         redfish_pool: shared_redfish_pool,
+        bmc_credential_ops,
         work_lock_manager_handle,
         rms_client,
         component_manager,
@@ -1087,6 +1175,12 @@ async fn initialize_and_start_controllers<'a>(
         credential_manager,
         ..
     } = api_service.as_ref();
+
+    let nvos_update_manager = rms_client.clone().map(|client| {
+        Arc::new(component_manager::rms::rms_nvos_update_manager(client))
+            as Arc<dyn component_manager::NvosUpdateManager>
+    });
+
     // As soon as we get the database up, observe this version of forge so that we know when it was
     // first deployed
     {
@@ -1339,24 +1433,6 @@ async fn initialize_and_start_controllers<'a>(
         emitter_builder.build()
     };
 
-    let switch_system_image_rms_client =
-        carbide_config
-            .rms
-            .api_url
-            .as_deref()
-            .none_if_empty()
-            .map(|url| {
-                let rms_client_config = librms::client_config::RmsClientConfig::new(
-                    carbide_config.rms.root_ca_path.clone(),
-                    carbide_config.rms.client_cert.clone(),
-                    carbide_config.rms.client_key.clone(),
-                    carbide_config.rms.enforce_tls,
-                );
-                let rms_api_config = librms::client::RmsApiConfig::new(url, &rms_client_config);
-                Arc::new(librms::RackManagerApi::new(&rms_api_config))
-                    as Arc<dyn carbide_rack::rms_client::SwitchSystemImageRmsClient>
-            });
-
     // Use the hostname as cluster-wide state controller ID
     // The expectation here is that either the host only runs a single
     // carbide instance natively, or - if the multiple instances run as containers
@@ -1470,6 +1546,7 @@ async fn initialize_and_start_controllers<'a>(
                 db_pool: db_pool.clone(),
                 db_reader: db_pool.clone().into(),
                 redfish_client_pool: shared_redfish_pool.clone(),
+                bmc_credential_ops: bmc_credential_ops.clone(),
                 ipmi_tool: ipmi_tool.clone(),
                 site_config: carbide_config.machine_state_handler_site_config().into(),
                 component_manager: component_manager.clone().map(Arc::new),
@@ -1486,6 +1563,10 @@ async fn initialize_and_start_controllers<'a>(
                 dpu_bmc_service_rotation_gate:
                     carbide_credential_rotation::RotationGate::new_for_family(
                         db::credential_rotation::CredentialRotationType::DpuBmcService,
+                    ),
+                nic_lockdown_rotation_gate:
+                    carbide_credential_rotation::RotationGate::new_for_family(
+                        db::credential_rotation::CredentialRotationType::LockdownIkm,
                     ),
                 per_object_metrics_registry: per_object_metrics_registry.clone(),
                 per_object_info: machine_per_object_info,
@@ -1685,6 +1766,7 @@ async fn initialize_and_start_controllers<'a>(
                     .power_shelf_state_controller
                     .rack_firmware_reprovisioning_enabled,
                 redfish_client_pool: shared_redfish_pool.clone(),
+                bmc_credential_ops: bmc_credential_ops.clone(),
                 bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
                     db::credential_rotation::CredentialRotationType::Bmc,
                 ),
@@ -1727,7 +1809,7 @@ async fn initialize_and_start_controllers<'a>(
                     rack_profiles: carbide_config.rack_profiles.clone(),
                 }
                 .into(),
-                switch_system_image_rms_client,
+                nvos_update_manager: nvos_update_manager.clone(),
                 credential_manager: credential_manager.clone(),
                 component_manager: component_manager.clone().map(Arc::new),
                 nmx_cluster_switch_mtls_services: carbide_config
@@ -1758,6 +1840,7 @@ async fn initialize_and_start_controllers<'a>(
                     .effective_switch_mtls_services_as_i32(),
                 per_object_metrics_registry: per_object_metrics_registry.clone(),
                 redfish_client_pool: shared_redfish_pool.clone(),
+                bmc_credential_ops: bmc_credential_ops.clone(),
                 bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
                     db::credential_rotation::CredentialRotationType::Bmc,
                 ),
@@ -1868,6 +1951,7 @@ async fn initialize_and_start_controllers<'a>(
         site_explorer_config,
         meter.clone(),
         endpoint_exploration_service.clone(),
+        api_service.bmc_client.clone(),
         common_pools.clone(),
         work_lock_manager_handle.clone(),
         carbide_config.rack_profiles.clone(),
@@ -1968,6 +2052,21 @@ mod tests {
         InitialObjectsConfig, VmaasConfig, default_hbn_bridge,
     };
     use crate::cfg::load::{merged_carbide_config_figment, parse_carbide_config};
+
+    #[test]
+    fn scoped_service_interface_detection_requires_a_scoped_name_and_selector() {
+        assert_eq!(
+            scoped_service_interface_names([
+                (Some("p0-bf3".to_string()), true),
+                (Some("p1-bf3gb200".to_string()), true),
+                (Some("p2-bf4".to_string()), false),
+                (Some("p3".to_string()), true),
+                (Some("p4-astra".to_string()), true),
+                (None, true),
+            ]),
+            vec!["p0-bf3", "p1-bf3gb200", "p4-astra"],
+        );
+    }
 
     /// Provides one intercept-bridging config entry for DPF normalization tests.
     fn test_intercept_config(interface: HostInterceptBridging) -> VmaasConfig {

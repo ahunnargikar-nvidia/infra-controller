@@ -18,7 +18,7 @@
 use std::str::FromStr;
 
 use ::rpc::forge::{AstraAttachment, AstraConfig, AstraConfigStatus, AstraPhase};
-use carbide_uuid::machine::MachineId;
+use carbide_uuid::machine::DpuMachineId;
 use carbide_uuid::spx::NULL_SPX_PARTITION_ID;
 use config_version::ConfigVersion;
 use db::ObjectColumnFilter;
@@ -72,7 +72,7 @@ pub(super) async fn get_astra_config(
     txn.commit().await?;
 
     if dpa_interfaces.is_empty() {
-        tracing::info!(
+        tracing::debug!(
             machine_id = %snapshot.host_snapshot.id,
             "No Astra NICs found; skipping Astra config retrieval",
         );
@@ -197,7 +197,7 @@ pub(super) async fn get_astra_config(
 /// 2) Does the host associated with the DPU have any Astra NICs? If not, just return
 pub(super) async fn process_astra_config_status(
     api: &Api,
-    dpu_machine_id: &MachineId,
+    dpu_machine_id: &DpuMachineId,
     astra_config_status: &AstraConfigStatus,
 ) -> Result<(), Status> {
     if !api.runtime_config.is_ewethers_enabled() || !api.runtime_config.is_astra_enabled() {

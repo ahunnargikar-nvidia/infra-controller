@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ::rpc::forge as rpc;
-use carbide_uuid::machine::MachineId;
+use carbide_uuid::machine::{MachineId, StableHostMachineId};
 use rpc::DpuServiceSyncReleaseStatus as ReleaseStatus;
 use rpc::forge_server::Forge;
 use tonic::Request;
@@ -37,11 +37,11 @@ use super::dpu_service_sync::{
     reset_host_to_waiting_for_ready,
 };
 
-fn by_machine_ids(ids: &[MachineId]) -> rpc::ReleaseDpuServiceSyncHoldRequest {
+fn by_machine_ids(ids: &[StableHostMachineId]) -> rpc::ReleaseDpuServiceSyncHoldRequest {
     rpc::ReleaseDpuServiceSyncHoldRequest {
         target: Some(
             rpc::release_dpu_service_sync_hold_request::Target::MachineIds(
-                ::rpc::common::MachineIdList {
+                ::rpc::common::StableHostMachineIdList {
                     machine_ids: ids.to_vec(),
                 },
             ),
@@ -52,7 +52,7 @@ fn by_machine_ids(ids: &[MachineId]) -> rpc::ReleaseDpuServiceSyncHoldRequest {
 async fn release(
     fixture: &Fixture,
     request: rpc::ReleaseDpuServiceSyncHoldRequest,
-) -> Vec<(MachineId, ReleaseStatus, String)> {
+) -> Vec<(StableHostMachineId, ReleaseStatus, String)> {
     fixture
         .env
         .api
@@ -73,7 +73,7 @@ async fn release(
 }
 
 /// The worklist as an operator reads it: ids first, detail fetched per page.
-async fn worklist_ids(fixture: &Fixture) -> Vec<MachineId> {
+async fn worklist_ids(fixture: &Fixture) -> Vec<StableHostMachineId> {
     fixture
         .env
         .api
@@ -285,11 +285,13 @@ async fn an_unknown_machine_rejects_the_whole_call_before_releasing(pool: sqlx::
     let fixture = provisioned(pool, outdated, release_fails).await;
     request_sync(&fixture.pool, &fixture.mh.id).await;
 
-    let unknown = MachineId::new(
+    let unknown: StableHostMachineId = MachineId::new(
         carbide_uuid::machine::MachineIdSource::ProductBoardChassisSerial,
         [0xAB; 32],
         carbide_uuid::machine::MachineType::Host,
-    );
+    )
+    .try_into()
+    .unwrap();
     let status = fixture
         .env
         .api
@@ -304,25 +306,6 @@ async fn an_unknown_machine_rejects_the_whole_call_before_releasing(pool: sqlx::
         "a rejected request must not have released the valid machines first"
     );
     assert!(is_outstanding(&fixture.pool, &fixture.mh.id).await);
-}
-
-/// The hold is per node, so honouring a DPU id would widen the request from one
-/// DPU to every DPU on its host.
-#[crate::sqlx_test]
-async fn a_dpu_id_is_rejected_rather_than_resolved_to_its_host(pool: sqlx::PgPool) {
-    let (outdated, release_fails) = unsynced();
-    let fixture = provisioned(pool, outdated, release_fails).await;
-    request_sync(&fixture.pool, &fixture.mh.id).await;
-
-    let status = fixture
-        .env
-        .api
-        .release_dpu_service_sync_hold(Request::new(by_machine_ids(&[fixture.mh.dpu_ids[0]])))
-        .await
-        .expect_err("a DPU id should be rejected");
-
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert_eq!(fixture.calls.hold_releases.load(Ordering::SeqCst), 0);
 }
 
 /// The worklist is what an operator reads before naming anything, so a released

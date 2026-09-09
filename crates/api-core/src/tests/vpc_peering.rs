@@ -16,7 +16,7 @@
  */
 use std::collections::HashMap;
 
-use carbide_uuid::machine::MachineId;
+use carbide_uuid::machine::{DpuMachineId, MachineId};
 use carbide_uuid::vpc::VpcId;
 use carbide_uuid::vpc_peering::VpcPeeringId;
 use futures_util::{FutureExt, TryFutureExt};
@@ -46,7 +46,7 @@ async fn create_test_vpcs(
     env: &TestEnv,
     count: i32,
     vtype: Option<VpcVirtualizationType>,
-) -> Result<MachineId, Box<dyn std::error::Error>> {
+) -> Result<DpuMachineId, Box<dyn std::error::Error>> {
     let default_tenant = default_tenant_config();
     let tenant_organization_id =
         if matches!(vtype, Some(VpcVirtualizationType::Fnn)) && env.config.fnn.is_some() {
@@ -176,7 +176,11 @@ async fn release_instances_from_vpcs(
         .api
         .find_machines_by_ids(
             rpc::forge::MachinesByIdsRequest {
-                machine_ids: instances.iter().filter_map(|i| i.machine_id).collect(),
+                machine_ids: instances
+                    .iter()
+                    .filter_map(|i| i.machine_id)
+                    .map(Into::into)
+                    .collect(),
                 include_history: false,
             }
             .into_request(),
@@ -430,7 +434,7 @@ async fn create_vpc_peering(
     env: &TestEnv,
     vtype1: VpcVirtualizationType,
     vtype2: VpcVirtualizationType,
-) -> Result<(VpcId, VpcId, u32, u32, MachineId), Box<dyn std::error::Error>> {
+) -> Result<(VpcId, VpcId, u32, u32, DpuMachineId), Box<dyn std::error::Error>> {
     let default_tenant = default_tenant_config();
     let peer_tenant_organization_id = "Tenant2";
     let use_fixture_tenants = env.config.fnn.is_some()

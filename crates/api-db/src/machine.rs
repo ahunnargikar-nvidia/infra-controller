@@ -18,13 +18,16 @@
 //! Machine - represents a database-backed Machine object
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::net::{IpAddr, Ipv6Addr};
 use std::ops::Deref;
 use std::str::FromStr;
 
 use carbide_uuid::dpa_interface::DpaInterfaceId;
 use carbide_uuid::instance_type::InstanceTypeId;
-use carbide_uuid::machine::{HostMachineId, MachineId, MachineType};
+use carbide_uuid::machine::{
+    DpuMachineId, HostMachineId, MachineId, MachineIdSubtypeTrait, MachineType, StableHostMachineId,
+};
 use carbide_uuid::machine_validation::MachineValidationId;
 use carbide_uuid::rack::{RackId, RackProfileId};
 use chrono::{DateTime, Utc};
@@ -50,10 +53,11 @@ use model::machine::nvlink::MachineNvLinkStatusObservation;
 use model::machine::spx::MachineSpxStatusObservation;
 use model::machine::upgrade_policy::AgentUpgradePolicy;
 use model::machine::{
-    CURRENT_STATE_MODEL_VERSION, Dpf, DpuInfo, DpuInfoStatusObservation, DpuOsOperationalState,
-    DpuRepresentorStatus, FailureDetails, HostProfile, Machine, MachineInterfaceSnapshot,
-    MachineLastRebootRequested, MachineLastRebootRequestedMode, MachineMaintenanceOperation,
-    MachineValidationContext, ManagedHostState, ReprovisionRequest, UpgradeDecision,
+    AnyMachine, CURRENT_STATE_MODEL_VERSION, Dpf, DpuInfo, DpuInfoStatusObservation, DpuMachine,
+    DpuOsOperationalState, DpuRepresentorStatus, FailureDetails, HostMachine, HostProfile, Machine,
+    MachineInterfaceSnapshot, MachineLastRebootRequested, MachineLastRebootRequestedMode,
+    MachineMaintenanceOperation, MachineValidationContext, ManagedHostState, ReprovisionRequest,
+    UpgradeDecision,
 };
 use model::machine_interface_address::MachineInterfaceAssociation;
 use model::metadata::Metadata;
@@ -85,6 +89,64 @@ lazy_static! {
     );
 }
 
+/// An item associated with a row in `machines`.
+pub trait MachineRowLockItem {
+    /// Returns the ID used to order machine-row lock acquisition.
+    fn machine_id(&self) -> MachineId;
+}
+
+impl MachineRowLockItem for MachineId {
+    fn machine_id(&self) -> MachineId {
+        *self
+    }
+}
+
+impl<T> MachineRowLockItem for (MachineId, T) {
+    fn machine_id(&self) -> MachineId {
+        self.0
+    }
+}
+
+/// An owning iterator in canonical `machines` row-lock acquisition order.
+///
+/// PostgreSQL holds row locks acquired by `UPDATE` until the transaction ends.
+/// If two transactions update overlapping machine batches in different orders,
+/// each can hold a row needed by the other, and PostgreSQL aborts one with
+/// SQLSTATE 40P01 (`deadlock_detected`). A common order prevents that cycle.
+///
+/// Construct this before the batch's first machine-row write so concurrent
+/// transactions acquire row locks in the same order.
+pub struct MachineRowLockOrderIter<T>(std::vec::IntoIter<T>);
+
+impl<T: MachineRowLockItem> MachineRowLockOrderIter<T> {
+    /// Orders machine-scoped batch items by their machine IDs.
+    pub fn new(mut items: Vec<T>) -> Self {
+        items.sort_unstable_by_key(MachineRowLockItem::machine_id);
+        Self(items.into_iter())
+    }
+}
+
+impl<T> MachineRowLockOrderIter<T> {
+    /// Returns the remaining ordered items as a slice.
+    pub fn as_slice(&self) -> &[T] {
+        self.0.as_slice()
+    }
+}
+
+impl<T> Iterator for MachineRowLockOrderIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl<T> ExactSizeIterator for MachineRowLockOrderIter<T> {}
+
 /// Load a Machine object matching an interface, creating it if not already present.
 /// Returns a tuple of (Machine, bool did_we_just_create_it)
 ///
@@ -97,7 +159,7 @@ pub async fn get_or_create(
     common_pools: Option<&CommonPools>,
     stable_machine_id: &MachineId,
     interface: &MachineInterfaceSnapshot,
-) -> DatabaseResult<Machine> {
+) -> DatabaseResult<AnyMachine> {
     let existing_machine =
         find_one(&mut *txn, stable_machine_id, MachineSearchConfig::default()).await?;
     if let Some(machine_id) = interface.machine_id.as_ref() {
@@ -155,11 +217,16 @@ pub async fn get_or_create(
     }
 }
 
-pub async fn find_one(
+pub async fn find_one<ID>(
     txn: impl DbReader<'_>,
-    id: &MachineId,
+    id: &ID,
     search_config: MachineSearchConfig,
-) -> Result<Option<Machine>, DatabaseError> {
+) -> Result<Option<Machine<ID>>, DatabaseError>
+where
+    ID: MachineIdSubtypeTrait,
+    ID: TryFrom<MachineId>,
+    DatabaseError: From<<ID as TryFrom<MachineId>>::Error>,
+{
     Ok(find(txn, ObjectFilter::One(*id), search_config)
         .await?
         .pop())
@@ -229,8 +296,8 @@ pub async fn find_existing_machine(
 /// * `txn` - A reference to a currently open database transaction
 /// * `state` - A reference to a MachineState enum
 // TODO: abhi, Make it private.
-pub async fn advance(
-    machine: &Machine,
+pub async fn advance<ID: MachineIdSubtypeTrait>(
+    machine: &Machine<ID>,
     txn: &mut PgConnection,
     state: &ManagedHostState,
     version: Option<ConfigVersion>,
@@ -269,11 +336,16 @@ pub async fn advance(
 /// * `filter`        - An ObjectFilter to control the size of the response set
 /// * `search_config` - A MachineSearchConfig with search options to control the
 ///   records selected
-pub async fn find(
+pub async fn find<ID>(
     txn: impl DbReader<'_>,
-    filter: ObjectFilter<'_, MachineId>,
+    filter: ObjectFilter<'_, ID>,
     search_config: MachineSearchConfig,
-) -> Result<Vec<Machine>, DatabaseError> {
+) -> Result<Vec<Machine<ID>>, DatabaseError>
+where
+    ID: MachineIdSubtypeTrait,
+    ID: TryFrom<MachineId>,
+    DatabaseError: From<<ID as TryFrom<MachineId>>::Error>,
+{
     // The TRUE will be optimized away by the query planner,
     // but it simplifies the rest of the building for us.
     lazy_static! {
@@ -333,19 +405,22 @@ pub async fn find(
         builder.push(" FOR UPDATE OF machines ");
     };
 
-    let all_machines: Vec<Machine> = builder
+    let all_machines: Vec<AnyMachine> = builder
         .build_query_as()
         .fetch_all(txn)
         .await
         .map_err(|e| DatabaseError::query(builder.sql(), e))?;
 
-    Ok(all_machines)
+    Ok(all_machines
+        .into_iter()
+        .map(AnyMachine::try_into_subtype)
+        .collect::<Result<Vec<Machine<_>>, _>>()?)
 }
 
 pub async fn find_by_ip(
     txn: &mut PgConnection,
     ip: &IpAddr,
-) -> Result<Option<Machine>, DatabaseError> {
+) -> Result<Option<AnyMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             r#"{}
@@ -433,7 +508,7 @@ pub async fn find_ids_by_instance_type_id(
     txn: &mut PgConnection,
     instance_type_id: &InstanceTypeId,
     for_update: bool,
-) -> Result<Vec<(MachineId, ConfigVersion)>, DatabaseError> {
+) -> Result<Vec<(HostMachineId, ConfigVersion)>, DatabaseError> {
     let mut builder = sqlx::QueryBuilder::new("SELECT id, version FROM machines WHERE");
 
     builder.push(" instance_type_id = ");
@@ -458,8 +533,8 @@ pub async fn find_ids_by_instance_type_id(
 /// * `machine_ids` - A slice of machine IDs to query for
 pub async fn find_nvlink_info_by_machine_ids(
     txn: &mut PgConnection,
-    machine_ids: &[MachineId],
-) -> Result<HashMap<MachineId, Option<MachineNvLinkInfo>>, DatabaseError> {
+    machine_ids: &[HostMachineId],
+) -> Result<HashMap<HostMachineId, Option<MachineNvLinkInfo>>, DatabaseError> {
     if machine_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -475,7 +550,8 @@ pub async fn find_nvlink_info_by_machine_ids(
 
     let mut result = HashMap::new();
     for row in rows {
-        let machine_id: MachineId = row.try_get(0).map_err(|e| DatabaseError::query(query, e))?;
+        let machine_id: HostMachineId =
+            row.try_get(0).map_err(|e| DatabaseError::query(query, e))?;
         let nvlink_info: Option<sqlx::types::Json<MachineNvLinkInfo>> =
             row.try_get(1).map_err(|e| DatabaseError::query(query, e))?;
         let nvlink_info = nvlink_info.map(|json| json.0);
@@ -488,7 +564,7 @@ pub async fn find_nvlink_info_by_machine_ids(
 async fn update_machine_instance_type(
     txn: &mut PgConnection,
     instance_type_id: Option<&InstanceTypeId>,
-    machine_versions: &[(&MachineId, &ConfigVersion)],
+    machine_versions: &[(&HostMachineId, &ConfigVersion)],
 ) -> Result<Vec<MachineId>, DatabaseError> {
     if machine_versions.is_empty() {
         return Ok(vec![]);
@@ -529,7 +605,7 @@ async fn update_machine_instance_type(
 pub async fn associate_machines_with_instance_type(
     txn: &mut PgConnection,
     instance_type_id: &InstanceTypeId,
-    machine_versions: &[(&MachineId, &ConfigVersion)],
+    machine_versions: &[(&HostMachineId, &ConfigVersion)],
 ) -> Result<Vec<MachineId>, DatabaseError> {
     update_machine_instance_type(txn, Some(instance_type_id), machine_versions).await
 }
@@ -541,7 +617,7 @@ pub async fn associate_machines_with_instance_type(
 /// * `machine_ids` - A slice of machine IDs to update
 pub async fn remove_instance_type_associations(
     txn: &mut PgConnection,
-    machine_versions: &[(&MachineId, &ConfigVersion)],
+    machine_versions: &[(&HostMachineId, &ConfigVersion)],
 ) -> Result<Vec<MachineId>, DatabaseError> {
     update_machine_instance_type(txn, None, machine_versions).await
 }
@@ -549,7 +625,7 @@ pub async fn remove_instance_type_associations(
 pub async fn find_by_hostname(
     txn: &mut PgConnection,
     hostname: &str,
-) -> Result<Option<Machine>, DatabaseError> {
+) -> Result<Option<AnyMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             "{} JOIN machine_interfaces mi ON m.id = mi.machine_id WHERE mi.hostname = $1 AND mi.interface_type != 'Bmc'",
@@ -569,7 +645,7 @@ pub async fn find_by_hostname(
 pub async fn find_by_mac_address(
     txn: &mut PgConnection,
     mac_address: &MacAddress,
-) -> Result<Option<Machine>, DatabaseError> {
+) -> Result<Option<AnyMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             "{} JOIN machine_interfaces mi ON m.id = mi.machine_id WHERE mi.mac_address = $1::macaddr AND mi.interface_type != 'Bmc'",
@@ -588,7 +664,7 @@ pub async fn find_by_mac_address(
 pub async fn find_by_loopback_ip(
     txn: impl DbReader<'_>,
     loopback_ip: &str,
-) -> Result<Option<Machine>, DatabaseError> {
+) -> Result<Option<AnyMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             "{} WHERE m.network_config->>'loopback_ip' = $1",
@@ -612,7 +688,7 @@ pub async fn find_by_loopback_ip(
 pub async fn find_by_query(
     txn: &mut PgConnection,
     query: &str,
-) -> Result<Option<Machine>, DatabaseError> {
+) -> Result<Option<AnyMachine>, DatabaseError> {
     if let Ok(id) = MachineId::from_str(query) {
         return find_one(txn, &id, MachineSearchConfig::default()).await;
     }
@@ -628,8 +704,8 @@ pub async fn find_by_query(
     find_by_hostname(txn, query).await
 }
 
-pub async fn update_reboot_time(
-    machine: &Machine,
+pub async fn update_reboot_time<ID: MachineIdSubtypeTrait>(
+    machine: &Machine<ID>,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     let query = "UPDATE machines SET last_reboot_time=NOW() WHERE id=$1 RETURNING id";
@@ -700,8 +776,8 @@ pub async fn update_restart_verification_status(
 ///
 /// This ensures cleanup completed after a concurrent state transition is recorded as newer than
 /// that transition, even when the cleanup transaction began first.
-pub async fn update_cleanup_time(
-    machine: &Machine,
+pub async fn update_cleanup_time<ID: MachineIdSubtypeTrait>(
+    machine: &Machine<ID>,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     // A cleanup transaction can begin before a concurrent state transition commits. Record the
@@ -817,8 +893,8 @@ pub async fn update_last_scout_observed_version(
 
 pub async fn find_host_by_dpu_machine_id(
     txn: &mut PgConnection,
-    dpu_machine_id: &MachineId,
-) -> Result<Option<Machine>, DatabaseError> {
+    dpu_machine_id: &DpuMachineId,
+) -> Result<Option<HostMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             r#"{} INNER JOIN machine_interfaces mi ON m.id = mi.machine_id
@@ -839,15 +915,15 @@ pub async fn find_host_by_dpu_machine_id(
 
 pub async fn lookup_host_machine_ids_by_dpu_ids(
     conn: impl DbReader<'_>,
-    dpu_machine_ids: &[MachineId],
-) -> Result<HashMap<MachineId, HostMachineId>, DatabaseError> {
+    dpu_machine_ids: &[DpuMachineId],
+) -> Result<HashMap<DpuMachineId, HostMachineId>, DatabaseError> {
     let query = r#"SELECT mi.attached_dpu_machine_id, mi.machine_id
         FROM machine_interfaces mi
         WHERE mi.attached_dpu_machine_id != mi.machine_id
         AND mi.interface_type != 'Bmc'
         AND mi.attached_dpu_machine_id = ANY($1)"#;
 
-    let dpu_id_host_id_pairs: Vec<(MachineId, HostMachineId)> = sqlx::query_as(query)
+    let dpu_id_host_id_pairs: Vec<(DpuMachineId, HostMachineId)> = sqlx::query_as(query)
         .bind(
             dpu_machine_ids
                 .iter()
@@ -902,8 +978,8 @@ pub async fn get_host_use_admin_network_for_dpa_interface(
 
 pub async fn find_dpus_by_host_machine_id(
     txn: &mut PgConnection,
-    host_machine_id: &MachineId,
-) -> Result<Vec<Machine>, DatabaseError> {
+    host_machine_id: &HostMachineId,
+) -> Result<Vec<DpuMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             r#"{}
@@ -960,7 +1036,7 @@ pub async fn update_metadata(
 /// Only does the update if the passed observation is newer than any existing one
 pub async fn update_network_status_observation(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     observation: &MachineNetworkStatusObservation,
 ) -> Result<(), DatabaseError> {
     let query = "UPDATE machines SET network_status_observation = $1::json WHERE id = $2 AND
@@ -1072,7 +1148,7 @@ pub async fn update_extension_service_status_observation(
 /// Only does the update if the passed observation is newer than any existing one
 pub async fn update_infiniband_status_observation(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     observation: &MachineInfinibandStatusObservation,
 ) -> Result<(), DatabaseError> {
     let query =
@@ -1114,7 +1190,7 @@ pub async fn update_nvlink_status_observation(
 /// Used when NMX-C is unreachable so instance state does not retain stale partition observations.
 pub async fn clear_nvlink_status_observations(
     txn: &mut PgConnection,
-    machine_ids: &[MachineId],
+    machine_ids: &[HostMachineId],
 ) -> Result<(), DatabaseError> {
     if machine_ids.is_empty() {
         return Ok(());
@@ -1133,7 +1209,7 @@ pub async fn clear_nvlink_status_observations(
 
 pub async fn update_spx_status_observation(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     observation: &MachineSpxStatusObservation,
 ) -> Result<(), DatabaseError> {
     tracing::debug!(
@@ -1205,7 +1281,7 @@ async fn debug_failed_machine_status_update(
 
 pub async fn update_dpu_agent_health_report(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     health_report: &HealthReport,
 ) -> Result<(), DatabaseError> {
     let mut health_report = health_report.clone();
@@ -1361,7 +1437,7 @@ pub async fn remove_health_report(
 
 pub async fn update_agent_reported_inventory(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     inventory: &MachineInventory,
 ) -> Result<(), DatabaseError> {
     let query =
@@ -1516,7 +1592,7 @@ async fn try_update_network_config_inner(
 /// row without bumping `network_config_version` or fanning out to the group.
 pub async fn set_use_admin_network_changed(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     value: bool,
 ) -> Result<(), DatabaseError> {
     let query = r#"
@@ -1543,7 +1619,7 @@ pub async fn set_use_admin_network_changed(
 /// the expected network config version.
 pub async fn clear_use_admin_network_changed_if_version_matches(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     expected_version: &ConfigVersion,
 ) -> Result<bool, DatabaseError> {
     let query = r#"
@@ -1570,9 +1646,9 @@ pub async fn clear_use_admin_network_changed_if_version_matches(
 /// so updating host id must not interfere state machine handling.
 pub async fn try_sync_stable_id_with_current_machine_id_for_host(
     txn: &mut PgConnection,
-    current_machine_id: &Option<MachineId>,
-    stable_machine_id: &MachineId,
-) -> Result<MachineId, DatabaseError> {
+    current_machine_id: Option<HostMachineId>,
+    stable_machine_id: &StableHostMachineId,
+) -> Result<StableHostMachineId, DatabaseError> {
     let Some(current_machine_id) = current_machine_id else {
         return Err(DatabaseError::NotFoundError {
             kind: "machine_id",
@@ -1581,8 +1657,8 @@ pub async fn try_sync_stable_id_with_current_machine_id_for_host(
     };
 
     // This is repeated call. Machine is already updated with stable ID.
-    if !current_machine_id.machine_type().is_predicted_host() {
-        return match find_one(txn, current_machine_id, MachineSearchConfig::default()).await? {
+    if let Ok(stable_host_id) = StableHostMachineId::try_from(current_machine_id) {
+        return match find_one(txn, &stable_host_id, MachineSearchConfig::default()).await? {
             Some(machine) => Ok(machine.id),
             None => Err(DatabaseError::NotFoundError {
                 kind: "machine",
@@ -1595,8 +1671,8 @@ pub async fn try_sync_stable_id_with_current_machine_id_for_host(
     crate::state_history::update_object_ids(
         txn,
         crate::state_history::StateHistoryTableId::Machine,
-        current_machine_id,
-        stable_machine_id,
+        &current_machine_id,
+        &stable_machine_id,
     )
     .await?;
     crate::health_history::update_object_ids(
@@ -1652,12 +1728,12 @@ pub async fn try_sync_stable_id_with_current_machine_id_for_host(
     Ok(machine_id)
 }
 
-pub async fn update_failure_details(
-    machine: &Machine,
+pub async fn update_failure_details<ID: MachineIdSubtypeTrait>(
+    machine: &Machine<ID>,
     txn: &mut PgConnection,
     failure: FailureDetails,
 ) -> Result<(), DatabaseError> {
-    update_failure_details_by_machine_id(&machine.id, txn, failure).await
+    update_failure_details_by_machine_id(machine.id.as_machine_id(), txn, failure).await
 }
 
 pub async fn clear_failure_details(
@@ -1695,7 +1771,7 @@ pub async fn create(
     state: ManagedHostState,
     expected_machine_data: Option<&ExpectedMachineData>,
     state_model_version: i16,
-) -> DatabaseResult<Machine> {
+) -> DatabaseResult<AnyMachine> {
     let stable_machine_id_string = stable_machine_id.to_string();
 
     let default_metadata = &Metadata::default();
@@ -1829,7 +1905,7 @@ pub async fn update_slot_and_tray(
 // Trigger DPU reprovisioning. For machine assigned to user, needs user approval to start
 // reprovisioning.
 pub async fn trigger_dpu_reprovisioning_request(
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     txn: &mut PgConnection,
     initiator: &str,
     update_firmware: bool,
@@ -1857,7 +1933,7 @@ pub async fn trigger_dpu_reprovisioning_request(
 
 // Update reprovision start time to the current time
 pub async fn update_dpu_reprovision_start_time(
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     update_dpu_reprovision_explicit_start_time(machine_id, chrono::Utc::now(), txn).await
@@ -1865,7 +1941,7 @@ pub async fn update_dpu_reprovision_start_time(
 
 // Update reprovision start time to a specific start time
 pub async fn update_dpu_reprovision_explicit_start_time(
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     time: DateTime<Utc>,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
@@ -1886,14 +1962,14 @@ pub async fn update_dpu_reprovision_explicit_start_time(
 
 // Update reprovision start time to the current time
 pub async fn update_host_reprovision_start_time(
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     update_host_reprovision_explicit_start_time(machine_id, chrono::Utc::now(), txn).await
 }
 
 pub async fn update_host_reprovision_explicit_start_time(
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     time: DateTime<Utc>,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
@@ -1914,7 +1990,7 @@ pub async fn update_host_reprovision_explicit_start_time(
 
 pub async fn get_host_reprovisioning_machines(
     txn: &mut PgConnection,
-) -> Result<Vec<Machine>, DatabaseError> {
+) -> Result<Vec<HostMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             "{}
@@ -1929,7 +2005,7 @@ pub async fn get_host_reprovisioning_machines(
 }
 
 pub async fn update_firmware_update_time_window_start_end(
-    machine_ids: &[MachineId],
+    machine_ids: &[impl MachineIdSubtypeTrait],
     start: chrono::DateTime<Utc>,
     end: chrono::DateTime<Utc>,
     txn: &mut PgConnection,
@@ -1937,7 +2013,7 @@ pub async fn update_firmware_update_time_window_start_end(
     let query = r#"UPDATE machines
                         SET firmware_update_time_window_start = $2, firmware_update_time_window_end = $3, update_complete = false
                        WHERE id = ANY($1) RETURNING id"#;
-    let _id = sqlx::query_as::<_, MachineId>(query)
+    sqlx::query_as::<_, MachineId>(query)
         .bind(machine_ids.iter().map(|x| x.to_string()).collect_vec())
         .bind(start)
         .bind(end)
@@ -1949,7 +2025,7 @@ pub async fn update_firmware_update_time_window_start_end(
 }
 
 pub async fn update_update_complete(
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     complete: bool,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
@@ -1983,7 +2059,7 @@ pub async fn update_controller_state_outcome(
 
 // Update user's approval status in db.
 pub async fn approve_dpu_reprovision_request(
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     let query = r#"UPDATE machines
@@ -2002,7 +2078,7 @@ pub async fn approve_dpu_reprovision_request(
 }
 
 pub async fn approve_host_reprovision_request(
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     let query = r#"UPDATE machines
@@ -2023,7 +2099,7 @@ pub async fn approve_host_reprovision_request(
 /// This will reset the dpu_reprov request.
 pub async fn restart_dpu_reprovisioning(
     txn: &mut PgConnection,
-    machine_ids: &[&MachineId],
+    machine_ids: &[&DpuMachineId],
     update_firmware: bool,
 ) -> Result<(), DatabaseError> {
     let restart_request = ReprovisionRequestRestart {
@@ -2048,7 +2124,7 @@ pub async fn restart_dpu_reprovisioning(
 /// This will fail if reprovisioning is already started.
 pub async fn clear_dpu_reprovisioning_request(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     validate_started_time: bool,
 ) -> Result<(), DatabaseError> {
     let query = if validate_started_time {
@@ -2070,7 +2146,7 @@ pub async fn clear_dpu_reprovisioning_request(
 
 pub async fn list_machines_requested_for_reprovisioning(
     txn: impl DbReader<'_>,
-) -> Result<Vec<Machine>, DatabaseError> {
+) -> Result<Vec<DpuMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             "{} WHERE m.reprovisioning_requested IS NOT NULL",
@@ -2085,7 +2161,7 @@ pub async fn list_machines_requested_for_reprovisioning(
 
 pub async fn list_machines_requested_for_host_reprovisioning(
     txn: impl DbReader<'_>,
-) -> Result<Vec<Machine>, DatabaseError> {
+) -> Result<Vec<HostMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             "{} WHERE m.host_reprovisioning_requested IS NOT NULL",
@@ -2103,7 +2179,7 @@ pub async fn list_machines_requested_for_host_reprovisioning(
 pub async fn apply_agent_upgrade_policy(
     txn: &mut PgConnection,
     policy: AgentUpgradePolicy,
-    machine: &Machine,
+    machine: &DpuMachine,
 ) -> Result<bool, DatabaseError> {
     if policy == AgentUpgradePolicy::Off {
         return Ok(false);
@@ -2134,7 +2210,7 @@ pub async fn apply_agent_upgrade_policy(
 
 pub async fn set_dpu_agent_upgrade_requested(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     should_upgrade: bool,
     to_version: &str,
 ) -> Result<(), DatabaseError> {
@@ -2153,10 +2229,14 @@ pub async fn set_dpu_agent_upgrade_requested(
     Ok(())
 }
 
-pub async fn find_machine_ids(
+pub async fn find_machine_ids<ID>(
     txn: impl DbReader<'_>,
     search_config: MachineSearchConfig,
-) -> Result<Vec<MachineId>, DatabaseError> {
+) -> Result<Vec<ID>, DatabaseError>
+where
+    ID: TryFrom<MachineId>,
+    DatabaseError: From<<ID as TryFrom<MachineId>>::Error>,
+{
     let mut qb = sqlx::QueryBuilder::new("SELECT id FROM machines");
 
     if search_config.mnnvl_only {
@@ -2264,12 +2344,15 @@ pub async fn find_machine_ids(
         .await
         .map_err(|e| DatabaseError::new("find_machine_ids", e))?;
 
-    Ok(machine_ids)
+    Ok(machine_ids
+        .into_iter()
+        .map(ID::try_from)
+        .collect::<Result<Vec<ID>, _>>()?)
 }
 
 pub async fn update_state(
     txn: &mut PgConnection,
-    host_id: &MachineId,
+    host_id: &HostMachineId,
     new_state: &ManagedHostState,
 ) -> Result<(), DatabaseError> {
     let host = find_one(
@@ -2419,9 +2502,10 @@ pub async fn find_dpu_infos(txn: &mut PgConnection) -> Result<Vec<DpuInfo>, Data
         .into_iter()
         .map(
             |(id, loopback_ip, controller_state, network_status_observation, firmware_version)| {
-                let dpu_id = MachineId::from_str(&id).map_err(|e| {
+                let dpu_id = DpuMachineId::try_from(MachineId::from_str(&id).map_err(|e| {
                     DatabaseError::internal(format!("Invalid DPU machine ID {id}: {e}"))
-                })?;
+                })?)
+                .map_err(|e| DatabaseError::internal(e.to_string()))?;
                 let network_status_observation = network_status_observation.0;
                 let representors = network_status_observation
                     .as_ref()
@@ -2449,14 +2533,32 @@ pub async fn find_dpu_infos(txn: &mut PgConnection) -> Result<Vec<DpuInfo>, Data
 
 /// Allocate a value from the loopback IP resource pool.
 ///
+/// Reuses the DPU's existing reservation before allocating a new value, so a
+/// surviving pool ownership record and a missing `network_config.loopback_ip`
+/// field cannot give one DPU two `lo-ip` values. A duplicate reservation for
+/// the same owner is reported as inconsistent state rather than picking one.
+///
 /// If the pool exists but is empty or has en error, return that.
 pub async fn allocate_loopback_ip(
     common_pools: &CommonPools,
     txn: &mut PgConnection,
     owner_id: &str,
 ) -> Result<IpAddr, DatabaseError> {
+    let pool = &common_pools.ethernet.pool_loopback_ip;
+
+    if let Some(value) = crate::resource_pool::find_owned_allocation(
+        pool,
+        txn,
+        resource_pool::OwnerType::Machine,
+        owner_id,
+    )
+    .await?
+    {
+        return Ok(value);
+    }
+
     match crate::resource_pool::allocate(
-        &common_pools.ethernet.pool_loopback_ip,
+        pool,
         txn,
         resource_pool::OwnerType::Machine,
         owner_id,
@@ -2471,7 +2573,7 @@ pub async fn allocate_loopback_ip(
             ),
         ) => {
             crate::resource_pool::emit_allocation_failure(
-                common_pools.ethernet.pool_loopback_ip.value_type,
+                pool.value_type,
                 owner_id,
                 false,
                 "lo-ip",
@@ -2481,7 +2583,7 @@ pub async fn allocate_loopback_ip(
         }
         Err(err) => {
             crate::resource_pool::emit_allocation_failure(
-                common_pools.ethernet.pool_loopback_ip.value_type,
+                pool.value_type,
                 owner_id,
                 false,
                 "lo-ip",
@@ -2606,7 +2708,7 @@ pub async fn allocate_vpc_dpu_loopback(
 pub async fn find_by_validation_id(
     txn: &mut PgConnection,
     validation_id: &MachineValidationId,
-) -> Result<Option<Machine>, DatabaseError> {
+) -> Result<Option<AnyMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             r#"{}
@@ -2643,12 +2745,12 @@ pub async fn set_firmware_autoupdate(
 
 pub async fn update_rack_fw_details(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     details: Option<&model::rack::RackFirmwareUpgradeStatus>,
 ) -> Result<(), DatabaseError> {
     let query =
         "UPDATE machines SET rack_fw_details = $1, updated = NOW() WHERE id = $2 RETURNING id";
-    sqlx::query_as::<_, MachineId>(query)
+    sqlx::query_as::<_, HostMachineId>(query)
         .bind(details.map(|d| sqlx::types::Json(d.clone())))
         .bind(machine_id)
         .fetch_optional(txn)
@@ -2676,7 +2778,7 @@ pub async fn set_machine_validation_request(
 
 pub async fn set_machine_maintenance_requested(
     txn: &mut PgConnection,
-    machine_id: MachineId,
+    machine_id: impl MachineIdSubtypeTrait,
     initiator: &str,
     operation: MachineMaintenanceOperation,
 ) -> DatabaseResult<()> {
@@ -2697,7 +2799,7 @@ pub async fn set_machine_maintenance_requested(
 
 pub async fn set_decommission_requested(
     txn: &mut PgConnection,
-    machine_id: MachineId,
+    machine_id: impl MachineIdSubtypeTrait,
 ) -> DatabaseResult<()> {
     let query = "UPDATE machines SET decommission_requested = TRUE WHERE id = $1 RETURNING id";
     sqlx::query_as::<_, MachineId>(query)
@@ -2710,7 +2812,7 @@ pub async fn set_decommission_requested(
 
 pub async fn clear_decommission_requested(
     txn: &mut PgConnection,
-    machine_id: MachineId,
+    machine_id: impl MachineIdSubtypeTrait,
 ) -> DatabaseResult<()> {
     let query = "UPDATE machines SET decommission_requested = FALSE WHERE id = $1 RETURNING id";
     sqlx::query_as::<_, MachineId>(query)
@@ -2723,7 +2825,7 @@ pub async fn clear_decommission_requested(
 
 pub async fn clear_machine_maintenance_requested(
     txn: &mut PgConnection,
-    machine_id: MachineId,
+    machine_id: impl MachineIdSubtypeTrait,
 ) -> DatabaseResult<()> {
     let query =
         "UPDATE machines SET machine_maintenance_requested = NULL WHERE id = $1 RETURNING id";
@@ -2740,7 +2842,7 @@ pub async fn clear_machine_maintenance_requested(
 /// The machine state controller consumes it on its next sweep.
 pub async fn set_bmc_credential_rotation_requested(
     txn: &mut PgConnection,
-    machine_id: MachineId,
+    machine_id: &MachineId,
 ) -> DatabaseResult<()> {
     let query =
         "UPDATE machines SET bmc_credential_rotation_requested = true WHERE id = $1 RETURNING id";
@@ -2762,7 +2864,7 @@ pub async fn set_bmc_credential_rotation_requested(
 
 pub async fn clear_bmc_credential_rotation_requested(
     txn: &mut PgConnection,
-    machine_id: MachineId,
+    machine_id: &MachineId,
 ) -> DatabaseResult<()> {
     let query =
         "UPDATE machines SET bmc_credential_rotation_requested = false WHERE id = $1 RETURNING id";
@@ -2828,6 +2930,75 @@ pub async fn clear_uefi_credential_rotation_requested(
             e => DatabaseError::new("clear_uefi_credential_rotation_requested", e),
         })?;
     Ok(())
+}
+
+/// Record that an operator has requested rotating the NIC lockdown keys for a host
+/// (bypasses the site-config flag for NIC lockdown rotation)
+pub async fn set_lockdown_ikm_credential_rotation_requested(
+    txn: &mut PgConnection,
+    machine_id: HostMachineId,
+) -> DatabaseResult<()> {
+    let query = "UPDATE machines SET lockdown_ikm_credential_rotation_requested = true \
+                 WHERE id = $1 RETURNING id";
+    sqlx::query_as::<_, MachineId>(query)
+        .bind(machine_id)
+        .fetch_one(txn)
+        .await
+        .map_err(|e| match e {
+            // `RETURNING id` yields no row for an unknown machine; surface a
+            // clean not-found rather than a generic wrapped error.
+            sqlx::Error::RowNotFound => DatabaseError::NotFoundError {
+                kind: "machine",
+                id: machine_id.to_string(),
+            },
+            e => DatabaseError::new("set_lockdown_ikm_credential_rotation_requested", e),
+        })?;
+    Ok(())
+}
+
+/// Clear the force NIC lockdown rotation flag for this host
+pub async fn clear_lockdown_ikm_credential_rotation_requested(
+    txn: &mut PgConnection,
+    machine_id: HostMachineId,
+) -> DatabaseResult<()> {
+    let query = "UPDATE machines SET lockdown_ikm_credential_rotation_requested = false \
+                 WHERE id = $1 RETURNING id";
+    sqlx::query_as::<_, MachineId>(query)
+        .bind(machine_id)
+        .fetch_one(txn)
+        .await
+        .map_err(|e| match e {
+            // `RETURNING id` yields no row for an unknown machine; surface a
+            // clean not-found rather than a generic wrapped error.
+            sqlx::Error::RowNotFound => DatabaseError::NotFoundError {
+                kind: "machine",
+                id: machine_id.to_string(),
+            },
+            e => DatabaseError::new("clear_lockdown_ikm_credential_rotation_requested", e),
+        })?;
+    Ok(())
+}
+
+/// Read a host's one-shot NIC lockdown IKM rotation force flag. The SVPC scout
+/// handler consults this so the tenant-allocation lock migrates a force-flagged
+/// host's cards to the site-wide target even when the site-wide gate is off,
+/// mirroring the idle rekey path.
+pub async fn get_lockdown_ikm_credential_rotation_requested(
+    conn: &mut PgConnection,
+    machine_id: HostMachineId,
+) -> DatabaseResult<bool> {
+    let query = "SELECT lockdown_ikm_credential_rotation_requested FROM machines WHERE id = $1";
+    sqlx::query_scalar::<_, bool>(query)
+        .bind(machine_id)
+        .fetch_one(conn)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => DatabaseError::NotFoundError {
+                kind: "machine",
+                id: machine_id.to_string(),
+            },
+            e => DatabaseError::new("get_lockdown_ikm_credential_rotation_requested", e),
+        })
 }
 
 pub async fn update_dpu_asns(
@@ -3171,7 +3342,7 @@ pub async fn get_quarantine_state(
 
 pub async fn set_quarantine_state(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     quarantine_state: ManagedHostQuarantineState,
 ) -> Result<Option<ManagedHostQuarantineState>, DatabaseError> {
     let (mut network_config, network_config_version) =
@@ -3306,42 +3477,8 @@ pub async fn find_rms_identities_by_bmc_ips(
     Ok(rows)
 }
 
-/// Persist the backend firmware-object job ID for a machine that was updated via
-/// --bypass-state-controller. This survives nico-api restarts so that
-/// get_firmware_status can keep querying the backend even after the in-memory map is
-/// cleared.
-pub async fn save_backend_firmware_object_job_id(
-    db: &sqlx::PgPool,
-    machine_id: &str,
-    job_id: &str,
-) -> DatabaseResult<()> {
-    let sql =
-        "UPDATE machines SET backend_firmware_object_job_id = $1 WHERE id::text = $2 RETURNING id";
-    sqlx::query(sql)
-        .bind(job_id)
-        .bind(machine_id)
-        .execute(db)
-        .await
-        .map_err(|e| DatabaseError::new(sql, e))?;
-    Ok(())
-}
-
-/// Fetch the persisted backend firmware-object job ID for a machine, if any.
-pub async fn get_backend_firmware_object_job_id(
-    db: &sqlx::PgPool,
-    machine_id: &str,
-) -> DatabaseResult<Option<String>> {
-    let sql = "SELECT backend_firmware_object_job_id FROM machines WHERE id::text = $1";
-    let row: Option<(Option<String>,)> = sqlx::query_as(sql)
-        .bind(machine_id)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| DatabaseError::new(sql, e))?;
-    Ok(row.and_then(|(job_id,)| job_id))
-}
-
 pub fn count_healthy_unhealthy_host_machines(
-    all_machines: &HashMap<MachineId, model::machine::ManagedHostStateSnapshot>,
+    all_machines: &HashMap<HostMachineId, model::machine::ManagedHostStateSnapshot>,
 ) -> (i32, i32) {
     let without_fault_count = all_machines
         .iter()
@@ -3367,7 +3504,10 @@ mod test {
     use std::sync::{Arc, Mutex};
 
     use carbide_instrument::testing::{MetricsCapture, capture_logs_async};
-    use carbide_uuid::machine::{MachineId, MachineInterfaceId};
+    use carbide_uuid::machine::{
+        HostMachineId, HostMachineIdSubtypeTrait, MachineId, MachineInterfaceId,
+        StableHostMachineId,
+    };
     use carbide_uuid::network::NetworkSegmentId;
     use model::allocation_type::AllocationType;
     use model::bmc_info::BmcInfo;
@@ -3433,8 +3573,8 @@ mod test {
             )
         }
 
-        let predicted_id = machine_id(1, MachineType::PredictedHost);
-        let stable_id = machine_id(1, MachineType::Host);
+        let predicted_id = HostMachineId::try_from(machine_id(1, MachineType::PredictedHost))?;
+        let stable_id = StableHostMachineId::try_from(machine_id(1, MachineType::Host))?;
 
         let mut txn = pool.begin().await?;
 
@@ -3467,7 +3607,7 @@ mod test {
         // rows reference the old id: the ON UPDATE CASCADE FK moves them.
         let renamed = super::try_sync_stable_id_with_current_machine_id_for_host(
             &mut txn,
-            &Some(predicted_id),
+            Some(predicted_id),
             &stable_id,
         )
         .await?;
@@ -3486,7 +3626,7 @@ mod test {
 
         let under_stable = crate::dpa_interface::find_by_machine_id(
             txn.as_mut(),
-            stable_id,
+            stable_id.to_host_machine_id(),
             DpaSearchConfig::default(),
         )
         .await?;
@@ -3924,6 +4064,65 @@ mod test {
         let stats = crate::resource_pool::stats(&pool, LOOPBACK_IP_V6).await?;
         assert_eq!(stats.used, 1);
         assert_eq!(stats.free, 0);
+        Ok(())
+    }
+
+    /// A surviving `lo-ip` pool reservation must satisfy the next allocation for
+    /// the same DPU. Otherwise a cleared `network_config.loopback_ip` field lets
+    /// one DPU consume a second IPv4 loopback, matching the IPv6 reuse contract.
+    #[crate::sqlx_test]
+    async fn ipv4_loopback_reservation_is_reused_and_leaves_one_owned_entry(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let common_pools = common_pools(&pool, None).await?;
+        let dpu_id =
+            MachineId::from_str("fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80")?;
+
+        let mut txn = pool.begin().await?;
+        let allocated =
+            super::allocate_loopback_ip(&common_pools, txn.as_mut(), &dpu_id.to_string()).await?;
+        let reused =
+            super::allocate_loopback_ip(&common_pools, txn.as_mut(), &dpu_id.to_string()).await?;
+        assert_eq!(allocated, reused);
+
+        let stats = crate::resource_pool::stats(txn.as_mut(), LOOPBACK_IP).await?;
+        assert_eq!(stats.used, 1);
+        txn.rollback().await?;
+        Ok(())
+    }
+
+    /// Two `lo-ip` rows owned by one DPU is corrupted state: allocation must
+    /// surface it as inconsistent rather than silently hand back one value and
+    /// leave the DPU still owning a second.
+    #[crate::sqlx_test]
+    async fn ipv4_loopback_rejects_multiple_reservations_for_one_dpu(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let common_pools = common_pools(&pool, None).await?;
+        let dpu_id =
+            MachineId::from_str("fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80")?;
+        let owner_id = dpu_id.to_string();
+
+        let mut txn = pool.begin().await?;
+        // Seed two reservations for the same owner so the ownership lookup sees
+        // more than one owned value.
+        for _ in 0..2 {
+            crate::resource_pool::allocate(
+                &common_pools.ethernet.pool_loopback_ip,
+                txn.as_mut(),
+                model::resource_pool::OwnerType::Machine,
+                &owner_id,
+                None,
+            )
+            .await?;
+        }
+
+        let error = super::allocate_loopback_ip(&common_pools, txn.as_mut(), &owner_id)
+            .await
+            .expect_err("two lo-ip values owned by one DPU must be rejected as inconsistent state");
+        assert!(matches!(error, crate::DatabaseError::FailedPrecondition(_)));
+
+        txn.rollback().await?;
         Ok(())
     }
 

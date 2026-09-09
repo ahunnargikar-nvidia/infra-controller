@@ -1629,6 +1629,7 @@ dependencies = [
  "carbide-secrets",
  "carbide-sqlx-testing",
  "carbide-test-support",
+ "carbide-uuid",
  "chrono",
  "libredfish",
  "mac_address",
@@ -1645,6 +1646,7 @@ version = "0.0.0"
 dependencies = [
  "carbide-dhcp",
  "carbide-dhcp-common",
+ "carbide-dhcpv6",
  "carbide-instrument",
  "carbide-rpc",
  "carbide-test-support",
@@ -1688,6 +1690,7 @@ name = "carbide-dhcp-server"
 version = "0.1.0"
 dependencies = [
  "carbide-dhcp-common",
+ "carbide-dhcpv6",
  "carbide-instrument",
  "carbide-rpc",
  "carbide-rpc-utils",
@@ -1698,7 +1701,11 @@ dependencies = [
  "clap",
  "dhcproto",
  "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "ipnetwork",
+ "libc",
  "logfmt",
  "lru",
  "metrics-endpoint",
@@ -1715,6 +1722,16 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "carbide-dhcpv6"
+version = "0.1.0"
+dependencies = [
+ "carbide-test-support",
+ "dhcproto",
+ "mac_address",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2718,6 +2735,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "state-controller",
+ "tokio",
  "tokio-util",
  "tonic",
  "tracing",
@@ -2885,7 +2903,6 @@ dependencies = [
  "sqlx",
  "state-controller",
  "tokio",
- "tonic",
  "tracing",
 ]
 
@@ -3280,6 +3297,7 @@ name = "carbide-ssh-console-mock-api-server"
 version = "0.0.1"
 dependencies = [
  "carbide-api-test-helper",
+ "carbide-proto-compiler",
  "carbide-rpc",
  "carbide-uuid",
  "carbide-version",
@@ -3317,20 +3335,30 @@ dependencies = [
  "carbide-health-metrics",
  "carbide-health-report",
  "carbide-instrument",
+ "carbide-rack",
  "carbide-redfish",
+ "carbide-rpc",
  "carbide-secrets",
+ "carbide-test-harness",
  "carbide-test-support",
  "carbide-utils",
  "carbide-uuid",
+ "chrono",
  "component-manager",
  "config-version",
  "eyre",
  "libredfish",
+ "librms",
  "mac_address",
  "opentelemetry 0.32.0",
+ "serde_json",
  "sqlx",
  "state-controller",
+ "tokio",
+ "tokio-util",
+ "tonic",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -6741,7 +6769,7 @@ dependencies = [
 [[package]]
 name = "libredfish"
 version = "0.0.0"
-source = "git+https://github.com/NVIDIA/libredfish.git?tag=v0.47.3#8f0eb0ed25955d9ba486b8c495f0adf9a85a8e7a"
+source = "git+https://github.com/NVIDIA/libredfish.git?tag=v0.47.5#569bc602d2aa03b3f2ea4c9e006d593a05c7b1dc"
 dependencies = [
  "chrono",
  "clap",
